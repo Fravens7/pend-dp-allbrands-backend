@@ -75,12 +75,14 @@ def get_consolidated_data():
 # --- ENDPOINTS ---
 @app.get("/")
 def home():
-    # La línea 'return' DEBE estar indentada con 4 espacios
-    return {"status": "ok", "message": "Deposit Dashboard API is running."} 
+    # Esta línea DEBE estar indentada 
+    return {"status": "ok", "message": "Backend funcionando correctamente."} 
 
 @app.get("/api/v1/dashboard")
 def dashboard_data():
-    # ... (Cuerpo completo de la función dashboard_data)
+    """
+    Proporciona todos los datos consolidados y KPIs para el Dashboard de Depósitos.
+    """
     try:
         df = get_consolidated_data()
         total_records = len(df)
@@ -94,10 +96,9 @@ def dashboard_data():
         else:
             oldest_date = df['DEPOSIT DATE'].min()
             time_difference = datetime.now() - oldest_date
-            max_age_days = round(time_difference.total_seconds() / 86400, 1) # Antigüedad en días
+            max_age_days = round(time_difference.total_seconds() / 86400, 1)
         
         # 3. Agregación: Tendencia Diaria (Gráfico)
-        # Agrupar por fecha de depósito (solo día) y contar
         daily_trend = df.groupby(df['DEPOSIT DATE'].dt.date)['DEPOSIT ID'].count().reset_index()
         daily_trend.columns = ['date', 'count']
         daily_trend['date'] = daily_trend['date'].astype(str)
