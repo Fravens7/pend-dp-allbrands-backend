@@ -75,3 +75,64 @@ def get_consolidated_data():
 # --- ENDPOINTS ---
 @app.get("/")
 def home():
+    # La línea 'return' DEBE estar indentada con 4 espacios
+    return {"status": "ok", "message": "Deposit Dashboard API is running."} 
+
+@app.get("/api/v1/dashboard")
+def dashboard_data():
+    # ... (Cuerpo completo de la función dashboard_data)
+    try:
+        df = get_consolidated_data()
+        total_records = len(df)
+        
+        # 1. KPI: Escalaciones Totales
+        total_escalations = total_records
+        
+        # 2. KPI: Antigüedad Máxima
+        if df.empty:
+            max_age_days = 0
+        else:
+            oldest_date = df['DEPOSIT DATE'].min()
+            time_difference = datetime.now() - oldest_date
+            max_age_days = round(time_difference.total_seconds() / 86400, 1) # Antigüedad en días
+        
+        # 3. Agregación: Tendencia Diaria (Gráfico)
+        # Agrupar por fecha de depósito (solo día) y contar
+        daily_trend = df.groupby(df['DEPOSIT DATE'].dt.date)['DEPOSIT ID'].count().reset_index()
+        daily_trend.columns = ['date', 'count']
+        daily_trend['date'] = daily_trend['date'].astype(str)
+        daily_trend_json = daily_trend.to_dict('records')
+        
+        # 4. Agregación: Conteo por Marca (Gráfico de Pastel/Tabla)
+        brand_count = df.groupby('BRAND')['DEPOSIT ID'].count().reset_index()
+        brand_count.columns = ['brand', 'count']
+        brand_count_json = brand_count.to_dict('records')
+        
+        # 5. Tabla Detallada (Lista completa de registros)
+        df_detail = df.sort_values(by='DEPOSIT DATE', ascending=False)
+        detail_columns = ['DEPOSIT ID', 'DEPOSIT DATE', 'CUSTOMER NUMBER', 'AMOUNT', 'Status', 'BRAND']
+        df_detail = df_detail[detail_columns].copy()
+        df_detail['DEPOSIT DATE'] = df_detail['DEPOSIT DATE'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        detailed_records = df_detail.to_dict('records')
+
+        # Estructura final del JSON de respuesta
+        response_data = {
+            "kpis": {
+                "total_escalations": int(total_escalations),
+                "max_age_days": max_age_days,
+                "data_range": 7
+            },
+            "charts": {
+                "daily_trend": daily_trend_json,
+                "brand_distribution": brand_count_json
+            },
+            "detailed_records": detailed_records
+        }
+        
+        return response_data
+
+    except (ConnectionError, FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ocurrió un error inesperado: {e}")
