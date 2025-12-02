@@ -4,3 +4,4 @@ gunicorn
 pandas
 gspread
 tabulate
+supabase
