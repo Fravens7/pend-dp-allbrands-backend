@@ -113,7 +113,11 @@ def run_sync_process():
 
             # Limpieza de fechas (solo si la columna existe)
             if 'DATE POSTED' in df.columns:
-                df['date_posted_iso'] = pd.to_datetime(df['DATE POSTED'], unit='s', errors='coerce')
+                # CORRECCIÓN: Primero convertimos a numérico explícitamente para evitar FutureWarning
+                timestamps_numeric = pd.to_numeric(df['DATE POSTED'], errors='coerce')
+                df['date_posted_iso'] = pd.to_datetime(timestamps_numeric, unit='s', errors='coerce')
+                
+                # Formateamos a string ISO
                 df['date_posted_iso'] = df['date_posted_iso'].dt.strftime('%Y-%m-%d %H:%M:%S%z').replace("NaT", None)
             else:
                 df['date_posted_iso'] = None
@@ -130,7 +134,6 @@ def run_sync_process():
                     posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
                     
                     # AQUÍ ESTÁ LA MAGIA: Guardamos TODO el diccionario de la fila en 'raw_json'
-                    # Incluye 'columna_extra_1', 'columna_extra_2', etc.
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
 
                     record = {
@@ -144,7 +147,7 @@ def run_sync_process():
                         "date_posted_unix": posted_final, 
                         "date_posted_iso": row.get('date_posted_iso'), 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
-                        "raw_json": raw_json_clean, # <--- Aquí va toda la basura y datos extras
+                        "raw_json": raw_json_clean, 
                         "updated_at": datetime.utcnow().isoformat()
                     }
                     records_to_upload.append(record)
