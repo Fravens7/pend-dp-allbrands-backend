@@ -171,20 +171,19 @@ def run_sync_process():
     last_execution_info["records_processed"] = total_nuevos
     print(f"✅ Sync Batch Finalizada. Registros: {total_nuevos}")
 
-# --- AUTO-LOOP DE 20 SEGUNDOS ---
+# --- AUTO-LOOP OPTIMIZADO (NO BLOQUEANTE) ---
 async def start_periodic_sync():
-    # Esperamos 5 segundos al arrancar para que el servidor inicie correctamente
-    # y evitar el error "WORKER TIMEOUT" del inicio.
     print("⏳ Esperando arranque del servidor...")
     await asyncio.sleep(5)
     
     while True:
-        # Ejecuta la sincronización
-        run_sync_process()
+        # CORRECCIÓN: Usamos 'to_thread' para no congelar el servidor
+        # Esto envía la sincronización a un hilo separado
+        print("🚀 Lanzando sincronización en hilo secundario...")
+        await asyncio.to_thread(run_sync_process)
         
-        # Espera 20 segundos
         print("⏳ Esperando 20 segundos...")
-        await asyncio.sleep(20) 
+        await asyncio.sleep(20)
 
 @app.on_event("startup")
 async def startup_event():
