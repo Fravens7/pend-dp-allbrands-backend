@@ -3,6 +3,8 @@ import pandas as pd
 import gspread
 import numpy as np
 import hashlib
+import uvicorn
+import gunicorn
 import uuid
 import time
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
