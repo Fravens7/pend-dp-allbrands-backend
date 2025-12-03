@@ -8,7 +8,7 @@ import asyncio
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, timezone
 
 # --- CONFIGURACIÓN ---
 app = FastAPI(title="Deposit Dashboard Worker Ultra-Fast")
@@ -17,11 +17,9 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ID DE TU SPREADSHEET
+# TUS VARIABLES
 SPREADSHEET_ID = "1i63fQR8_M8eWLdZsa3QPL_aOCg8labb_W9QmK_w8FXY"
-# Las hojas que quieres leer
 SHEET_NAMES = ['M1', 'M2', 'B1', 'B2', 'K1', 'B3', 'B4']
-
 CREDENTIALS_FILE = "credentials.json"
 SUPABASE_URL = os.environ.get("SUPABASE_URL") 
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -43,7 +41,7 @@ def generar_id_unico(row, brand):
     raw_str = f"{brand}_{row.get('DEPOSIT ID')}_{row.get('USERNAME')}_{row.get('AMOUNT')}_{row.get('DATE POSTED')}"
     return hashlib.md5(raw_str.encode()).hexdigest()
 
-# --- PROCESO DE SINCRONIZACIÓN OPTIMIZADO (BATCH) ---
+# --- PROCESO DE SINCRONIZACIÓN CON BARRIDO ---
 def run_sync_process():
     global last_execution_info
     
@@ -51,7 +49,9 @@ def run_sync_process():
         print("⚠️ Ejecución anterior aún en curso. Saltando ciclo.")
         return
 
-    print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Iniciando Sincronización Rápida...")
+    # Hora de inicio del ciclo (UTC)
+    cycle_start_time = datetime.now(timezone.utc).isoformat()
+    print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Iniciando Sync...")
     last_execution_info["status"] = "Running"
 
     try:
@@ -71,13 +71,9 @@ def run_sync_process():
             
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # --- OPTIMIZACIÓN: BATCH GET (1 SOLA LLAMADA A GOOGLE) ---
-        # En lugar de pedir 7 veces, pedimos 1 vez todos los rangos
-        # Pedimos desde la columna A hasta la Z (o más si necesitas)
+        # BATCH GET (Traer todo de golpe)
         ranges = [f"{name}!A:Z" for name in SHEET_NAMES]
-        
         try:
-            # Esta es la magia: Trae todo de golpe
             batch_results = sh.values_batch_get(ranges)
         except Exception as e:
             print(f"❌ Error leyendo Google Sheets: {e}")
@@ -91,22 +87,23 @@ def run_sync_process():
 
     total_nuevos = 0
     
-    # Iteramos sobre los resultados en memoria (ya no llamamos a Google)
+    # Procesar hoja por hoja
     for i, result in enumerate(batch_results.get('valueRanges', [])):
         sheet_name = SHEET_NAMES[i]
         values = result.get('values', [])
         
+        # Saltamos si no hay datos suficientes
         if len(values) < 2:
             continue
 
         try:
-            # Procesamiento de datos en Pandas (Igual que antes)
             original_headers = values.pop(0)
             final_headers = [h.strip() if h.strip() else f"col_extra_{j}" for j, h in enumerate(original_headers)]
             
             df = pd.DataFrame(values, columns=final_headers)
             if df.empty: continue
             
+            # Limpieza de fechas
             if 'DATE POSTED' in df.columns:
                 timestamps_numeric = pd.to_numeric(df['DATE POSTED'], errors='coerce')
                 df['date_posted_iso'] = pd.to_datetime(timestamps_numeric, unit='s', errors='coerce')
@@ -115,8 +112,6 @@ def run_sync_process():
                 df['date_posted_iso'] = None
 
             records_to_upload = []
-            
-            # Usamos un set para evitar procesar duplicados internos de la misma carga
             seen_ids = set()
 
             for index, row in df.iterrows():
@@ -127,7 +122,6 @@ def run_sync_process():
                     if record_id in seen_ids: continue
                     seen_ids.add(record_id)
                     
-                    # Limpieza rápida
                     raw_amount = pd.to_numeric(str(row.get('AMOUNT', '')).replace(',', ''), errors='coerce')
                     amount_final = limpiar_valor(raw_amount) or 0
                     posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
@@ -146,7 +140,8 @@ def run_sync_process():
                         "date_posted_iso": row.get('date_posted_iso'), 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
                         "raw_json": raw_json_clean, 
-                        "updated_at": datetime.utcnow().isoformat()
+                        # IMPORTANTE: Esta fecha permite el "Barrido"
+                        "updated_at": datetime.now(timezone.utc).isoformat()
                     }
                     records_to_upload.append(record)
                     
@@ -155,11 +150,26 @@ def run_sync_process():
 
             if records_to_upload:
                 try:
-                    # Upsert masivo a Supabase
+                    # 1. UPSERT (Actualizamos lo que existe en el Excel)
                     supabase.table("deposits").upsert(
                         records_to_upload, on_conflict="id", ignore_duplicates=False
                     ).execute()
+                    
                     total_nuevos += len(records_to_upload)
+
+                    # 2. EL BARRIDO (THE SWEEP) - Limpieza de fantasmas
+                    # Lógica: "Si eres de esta Marca, tienes estatus 'ALREADY FOLLOW UP',
+                    # PERO tu fecha 'updated_at' es vieja (menor a cycle_start_time),
+                    # significa que NO estabas en el Excel que acabo de leer. ¡Desaparece!"
+                    
+                    supabase.table("deposits").update({"status": "CLEARED_AUTO"}) \
+                        .eq("brand", sheet_name) \
+                        .eq("status", "ALREADY FOLLOW UP") \
+                        .lt("updated_at", cycle_start_time) \
+                        .execute()
+                        
+                    print(f" ✅ {sheet_name}: Sincronizado y Limpio.")
+
                 except Exception as e:
                     print(f"❌ Error Supabase {sheet_name}: {e}")
 
@@ -169,25 +179,25 @@ def run_sync_process():
     last_execution_info["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     last_execution_info["status"] = "Idle"
     last_execution_info["records_processed"] = total_nuevos
-    print(f"✅ Sync Batch Finalizada. Registros: {total_nuevos}")
+    print(f"✅ Ciclo terminado. Total: {total_nuevos}")
 
-# --- AUTO-LOOP OPTIMIZADO (NO BLOQUEANTE) ---
+# --- AUTO-LOOP (HILO SECUNDARIO) ---
 async def start_periodic_sync():
-    print("⏳ Esperando arranque del servidor...")
+    print("⏳ Esperando arranque del servidor (5s)...")
     await asyncio.sleep(5)
     
     while True:
-        # CORRECCIÓN: Usamos 'to_thread' para no congelar el servidor
-        # Esto envía la sincronización a un hilo separado
-        print("🚀 Lanzando sincronización en hilo secundario...")
+        # HEARTBEAT: Mensaje para saber que no estamos muertos
+        print(f"💓 [{datetime.now().strftime('%H:%M:%S')}] Servidor activo. Esperando ciclo...")
+        
+        # Ejecutar proceso en hilo aparte
         await asyncio.to_thread(run_sync_process)
         
-        print("⏳ Esperando 20 segundos...")
-        await asyncio.sleep(20)
+        # Esperar 20 segundos
+        await asyncio.sleep(20) 
 
 @app.on_event("startup")
 async def startup_event():
-    # Lanza el bucle en segundo plano
     asyncio.create_task(start_periodic_sync())
 
 # --- ENDPOINTS ---
@@ -195,7 +205,6 @@ async def startup_event():
 def home():
     return last_execution_info
 
-# Endpoint para los HEAD checks de Render (Evita el error 405 en logs)
 @app.head("/")
 def health_check():
     return "OK"
@@ -203,10 +212,8 @@ def health_check():
 @app.get("/trigger-sync")
 def trigger_sync(background_tasks: BackgroundTasks, secret: str = None):
     if secret != CRON_SECRET:
-        raise HTTPException(status_code=401, detail="Clave secreta inválida")
-    
+        raise HTTPException(status_code=401, detail="Clave inválida")
     if last_execution_info["status"] == "Running":
-         return {"message": "⚠️ Ya en curso.", "timestamp": datetime.now()}
-    
+         return {"message": "⚠️ En curso."}
     background_tasks.add_task(run_sync_process)
-    return {"message": "Sync iniciada", "timestamp": datetime.now()}
+    return {"message": "Sync manual iniciada"}
