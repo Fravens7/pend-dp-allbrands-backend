@@ -85,7 +85,7 @@ def run_sync_process():
             
             ws = sh.worksheet(sheet_name)
             
-            # --- CAMBIO IMPORTANTE: LECTURA TOTAL (BASURA INCLUIDA) ---
+            # --- LECTURA ROBUSTA ---
             all_values = ws.get_all_values()
             
             if len(all_values) < 2: 
@@ -109,11 +109,10 @@ def run_sync_process():
             df = pd.DataFrame(all_values, columns=final_headers)
             
             if df.empty: continue
-            # ------------------------------------------
-
+            
             # Limpieza de fechas (solo si la columna existe)
             if 'DATE POSTED' in df.columns:
-                # CORRECCIÓN: Primero convertimos a numérico explícitamente para evitar FutureWarning
+                # CORRECCIÓN: Primero convertimos a numérico explícitamente
                 timestamps_numeric = pd.to_numeric(df['DATE POSTED'], errors='coerce')
                 df['date_posted_iso'] = pd.to_datetime(timestamps_numeric, unit='s', errors='coerce')
                 
@@ -122,22 +121,28 @@ def run_sync_process():
             else:
                 df['date_posted_iso'] = None
 
-            records_to_upload = []
+            # --- CAMBIO IMPORTANTE: DEDUPLICACIÓN EN MEMORIA ---
+            # Usamos un diccionario keyed por ID. Si viene un duplicado, sobrescribe al anterior.
+            # Esto evita enviar dos veces el mismo ID a Supabase en el mismo lote.
+            records_map = {} 
 
             for index, row in df.iterrows():
                 try:
                     unique_hash = generar_id_unico(row, sheet_name)
+                    # ID Técnico para la BD
+                    record_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_hash))
+                    
                     display_deposit_id = str(row.get('DEPOSIT ID', '')).strip() or f"NO_ID_{index}"
                     
                     raw_amount = pd.to_numeric(str(row.get('AMOUNT', '')).replace(',', ''), errors='coerce')
                     amount_final = limpiar_valor(raw_amount) or 0
                     posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
                     
-                    # AQUÍ ESTÁ LA MAGIA: Guardamos TODO el diccionario de la fila en 'raw_json'
+                    # Guardamos TODO
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
 
                     record = {
-                        "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_hash)),
+                        "id": record_id,
                         "deposit_id": display_deposit_id,
                         "brand": sheet_name,
                         "username": str(row.get('USERNAME', '')),
@@ -150,9 +155,15 @@ def run_sync_process():
                         "raw_json": raw_json_clean, 
                         "updated_at": datetime.utcnow().isoformat()
                     }
-                    records_to_upload.append(record)
+                    
+                    # Al usar el ID como clave del diccionario, los duplicados se eliminan automáticamente
+                    records_map[record_id] = record
+                    
                 except Exception as e_row:
                     continue
+
+            # Convertimos el mapa de vuelta a una lista para Supabase
+            records_to_upload = list(records_map.values())
 
             if records_to_upload:
                 try:
@@ -160,6 +171,9 @@ def run_sync_process():
                     supabase.table("deposits").upsert(
                         records_to_upload, on_conflict="id", ignore_duplicates=False
                     ).execute()
+                    
+                    # Log de éxito
+                    print(f" ✅ {sheet_name}: {len(records_to_upload)} registros procesados.")
                     total_nuevos += len(records_to_upload)
                 except Exception as e:
                     print(f"❌ Error Supabase {sheet_name}: {e}")
@@ -170,7 +184,7 @@ def run_sync_process():
     last_execution_info["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     last_execution_info["status"] = "Idle"
     last_execution_info["records_processed"] = total_nuevos
-    print(f"✅ Sincronización fin. Total: {total_nuevos}")
+    print(f"✅ Sincronización fin. Total global: {total_nuevos}")
 
 # --- ENDPOINTS ---
 
