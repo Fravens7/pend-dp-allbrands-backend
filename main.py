@@ -41,6 +41,8 @@ def limpiar_valor(valor):
     return valor
 
 def generar_id_unico(row, brand):
+    # Usamos campos clave para identificar duplicados reales. 
+    # Si todo esto es igual, es la misma transacción.
     raw_str = f"{brand}_{row.get('DEPOSIT ID')}_{row.get('USERNAME')}_{row.get('AMOUNT')}_{row.get('DATE POSTED')}"
     return hashlib.md5(raw_str.encode()).hexdigest()
 
@@ -81,35 +83,37 @@ def run_sync_process():
             
             ws = sh.worksheet(sheet_name)
             
-            # --- CAMBIO IMPORTANTE: LECTURA ROBUSTA ---
-            # En lugar de get_all_records() (que falla con columnas vacías),
-            # traemos todo como matriz y lo limpiamos con Pandas.
+            # --- CAMBIO IMPORTANTE: LECTURA TOTAL (BASURA INCLUIDA) ---
             all_values = ws.get_all_values()
             
             if len(all_values) < 2: 
                 print(f"   ⚠️ Hoja {sheet_name} vacía o sin datos.")
                 continue
 
-            # La primera fila son los headers, el resto son datos
-            headers = all_values.pop(0)
-            df = pd.DataFrame(all_values, columns=headers)
-
-            # 1. Eliminar columnas que no tengan nombre (headers vacíos)
-            # Esto soluciona el error "duplicates: ['']"
-            df = df.loc[:, df.columns != '']
+            # Extraemos headers originales
+            original_headers = all_values.pop(0)
             
-            # 2. Eliminar columnas totalmente duplicadas si las hubiera
-            df = df.loc[:, ~df.columns.duplicated()]
-
+            # Renombramos headers vacíos en lugar de borrarlos
+            final_headers = []
+            empty_counter = 1
+            for h in original_headers:
+                if not h.strip():
+                    final_headers.append(f"columna_extra_{empty_counter}")
+                    empty_counter += 1
+                else:
+                    final_headers.append(h.strip())
+            
+            # Creamos el DataFrame con TODAS las columnas
+            df = pd.DataFrame(all_values, columns=final_headers)
+            
             if df.empty: continue
             # ------------------------------------------
 
-            # Limpieza de fechas
+            # Limpieza de fechas (solo si la columna existe)
             if 'DATE POSTED' in df.columns:
                 df['date_posted_iso'] = pd.to_datetime(df['DATE POSTED'], unit='s', errors='coerce')
                 df['date_posted_iso'] = df['date_posted_iso'].dt.strftime('%Y-%m-%d %H:%M:%S%z').replace("NaT", None)
             else:
-                # Si falta la columna, evitamos que el código explote
                 df['date_posted_iso'] = None
 
             records_to_upload = []
@@ -123,7 +127,8 @@ def run_sync_process():
                     amount_final = limpiar_valor(raw_amount) or 0
                     posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
                     
-                    # Convertimos a dict y limpiamos NaNs
+                    # AQUÍ ESTÁ LA MAGIA: Guardamos TODO el diccionario de la fila en 'raw_json'
+                    # Incluye 'columna_extra_1', 'columna_extra_2', etc.
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
 
                     record = {
@@ -137,16 +142,16 @@ def run_sync_process():
                         "date_posted_unix": posted_final, 
                         "date_posted_iso": row.get('date_posted_iso'), 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
-                        "raw_json": raw_json_clean,
+                        "raw_json": raw_json_clean, # <--- Aquí va toda la basura y datos extras
                         "updated_at": datetime.utcnow().isoformat()
                     }
                     records_to_upload.append(record)
                 except Exception as e_row:
-                    # print(f"Error fila {index}: {e_row}")
                     continue
 
             if records_to_upload:
                 try:
+                    # Upsert masivo
                     supabase.table("deposits").upsert(
                         records_to_upload, on_conflict="id", ignore_duplicates=False
                     ).execute()
