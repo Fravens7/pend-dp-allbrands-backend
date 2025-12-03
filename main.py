@@ -5,8 +5,6 @@ import numpy as np
 import hashlib
 import uuid
 import time
-import uvicorn
-import gunicorn
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -54,13 +52,9 @@ def run_sync_process():
 
     try:
         # LÓGICA DE CREDENCIALES
-        # Opción A: Archivo local (si lo subiste al repo - no recomendado por seguridad)
         if os.path.exists(CREDENTIALS_FILE):
              gc = gspread.service_account(filename=CREDENTIALS_FILE)
-        # Opción B: Variables de entorno (Mejor para Render)
         else:
-             # Aquí deberías implementar la carga desde JSON en ENV si decides hacerlo más pro
-             # Por ahora, asume que fallará si no está el archivo
              print("⚠️ No se encontró credentials.json")
              last_execution_info["status"] = "Error: No credentials"
              return
@@ -86,14 +80,37 @@ def run_sync_process():
             time.sleep(2) # Pausa anti-bloqueo de Google
             
             ws = sh.worksheet(sheet_name)
-            data = ws.get_all_records()
-            df = pd.DataFrame(data)
+            
+            # --- CAMBIO IMPORTANTE: LECTURA ROBUSTA ---
+            # En lugar de get_all_records() (que falla con columnas vacías),
+            # traemos todo como matriz y lo limpiamos con Pandas.
+            all_values = ws.get_all_values()
+            
+            if len(all_values) < 2: 
+                print(f"   ⚠️ Hoja {sheet_name} vacía o sin datos.")
+                continue
+
+            # La primera fila son los headers, el resto son datos
+            headers = all_values.pop(0)
+            df = pd.DataFrame(all_values, columns=headers)
+
+            # 1. Eliminar columnas que no tengan nombre (headers vacíos)
+            # Esto soluciona el error "duplicates: ['']"
+            df = df.loc[:, df.columns != '']
+            
+            # 2. Eliminar columnas totalmente duplicadas si las hubiera
+            df = df.loc[:, ~df.columns.duplicated()]
 
             if df.empty: continue
+            # ------------------------------------------
 
             # Limpieza de fechas
-            df['date_posted_iso'] = pd.to_datetime(df['DATE POSTED'], unit='s', errors='coerce')
-            df['date_posted_iso'] = df['date_posted_iso'].dt.strftime('%Y-%m-%d %H:%M:%S%z').replace("NaT", None)
+            if 'DATE POSTED' in df.columns:
+                df['date_posted_iso'] = pd.to_datetime(df['DATE POSTED'], unit='s', errors='coerce')
+                df['date_posted_iso'] = df['date_posted_iso'].dt.strftime('%Y-%m-%d %H:%M:%S%z').replace("NaT", None)
+            else:
+                # Si falta la columna, evitamos que el código explote
+                df['date_posted_iso'] = None
 
             records_to_upload = []
 
@@ -104,7 +121,9 @@ def run_sync_process():
                     
                     raw_amount = pd.to_numeric(str(row.get('AMOUNT', '')).replace(',', ''), errors='coerce')
                     amount_final = limpiar_valor(raw_amount) or 0
-                    posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce'))
+                    posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
+                    
+                    # Convertimos a dict y limpiamos NaNs
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
 
                     record = {
@@ -116,13 +135,14 @@ def run_sync_process():
                         "status": str(row.get('Status', '')),
                         "deposit_date_user": str(row.get('DEPOSIT DATE', '')),
                         "date_posted_unix": posted_final, 
-                        "date_posted_iso": row['date_posted_iso'], 
+                        "date_posted_iso": row.get('date_posted_iso'), 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
                         "raw_json": raw_json_clean,
                         "updated_at": datetime.utcnow().isoformat()
                     }
                     records_to_upload.append(record)
-                except Exception:
+                except Exception as e_row:
+                    # print(f"Error fila {index}: {e_row}")
                     continue
 
             if records_to_upload:
@@ -135,7 +155,7 @@ def run_sync_process():
                     print(f"❌ Error Supabase {sheet_name}: {e}")
 
         except Exception as e:
-            print(f"❌ Error hoja {sheet_name}: {e}")
+            print(f"❌ Error general en hoja {sheet_name}: {e}")
 
     last_execution_info["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     last_execution_info["status"] = "Idle"
@@ -148,14 +168,11 @@ def run_sync_process():
 def home():
     return last_execution_info
 
-# ESTE ES EL NUEVO CEREBRO DEL SISTEMA
 @app.get("/trigger-sync")
 def trigger_sync(background_tasks: BackgroundTasks, secret: str = None):
-    # Seguridad simple para que nadie sature tu API
     if secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Clave secreta inválida")
     
-    # Esto lanza la función en segundo plano y responde INMEDIATAMENTE al cron
     background_tasks.add_task(run_sync_process)
     
     return {"message": "Sincronización iniciada en segundo plano", "timestamp": datetime.now()}
