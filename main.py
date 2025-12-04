@@ -32,15 +32,10 @@ last_execution_info = {
     "records_processed": 0
 }
 
-# --- SANITIZADOR RECURSIVO (LA SOLUCIÓN FINAL) ---
+# --- SANITIZADOR ---
 def sanitize_for_json(obj):
-    """
-    Recorre recursivamente cualquier objeto (dict, list) y reemplaza
-    NaNs o Infinitos con None. Esto asegura compatibilidad JSON 100%.
-    """
     if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
+        if math.isnan(obj) or math.isinf(obj): return None
         return obj
     elif isinstance(obj, dict):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
@@ -49,19 +44,28 @@ def sanitize_for_json(obj):
     elif isinstance(obj, (np.integer, np.int64)):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float64)):
-        if np.isnan(obj) or np.isinf(obj):
-            return None
+        if np.isnan(obj) or np.isinf(obj): return None
         return float(obj)
     elif pd.isna(obj):
         return None
     return obj
 
+def limpiar_valor(valor):
+    if pd.isna(valor): return None
+    if isinstance(valor, str):
+        if not valor.strip(): return None
+        return valor
+    if isinstance(valor, (float, np.floating)):
+        if math.isnan(valor) or math.isinf(valor): return None
+        return float(valor)
+    if isinstance(valor, (int, np.integer)): return int(valor)
+    return valor
+
 def generar_id_unico(row, brand):
-    # Convertimos a string forzado para evitar errores de hash
     raw_str = f"{brand}_{str(row.get('DEPOSIT ID'))}_{str(row.get('USERNAME'))}_{str(row.get('AMOUNT'))}_{str(row.get('DATE POSTED'))}"
     return hashlib.md5(raw_str.encode()).hexdigest()
 
-# --- PROCESO DE SINCRONIZACIÓN ---
+# --- PROCESO ---
 def run_sync_process():
     global last_execution_info
     
@@ -90,7 +94,6 @@ def run_sync_process():
             
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Batch Get
         ranges = [f"{name}!A:Z" for name in SHEET_NAMES]
         try:
             batch_results = sh.values_batch_get(ranges)
@@ -110,8 +113,7 @@ def run_sync_process():
         sheet_name = SHEET_NAMES[i]
         values = result.get('values', [])
         
-        if len(values) < 2:
-            continue
+        if len(values) < 2: continue
 
         try:
             original_headers = values.pop(0)
@@ -120,8 +122,7 @@ def run_sync_process():
             df = pd.DataFrame(values, columns=final_headers)
             if df.empty: continue
             
-            # --- LIMPIEZA PRELIMINAR ---
-            # Forzamos conversión a numérico donde corresponde para detectar NaNs
+            # Limpiezas previas
             if 'AMOUNT' in df.columns:
                 df['AMOUNT'] = pd.to_numeric(df['AMOUNT'].astype(str).str.replace(',', ''), errors='coerce')
             
@@ -133,41 +134,60 @@ def run_sync_process():
                 df['date_posted_iso'] = None
 
             records_to_upload = []
-            seen_ids = set()
+            
+            # --- FILTROS DE DEDUPLICACIÓN ---
+            seen_ids = set()          # Para IDs generados (Hash)
+            seen_constraints = set()  # NUEVO: Para contenido real (Marca+User+Monto+Fecha)
 
             for index, row in df.iterrows():
                 try:
-                    # 1. Filtro de Fila Vacía (Si no hay usuario ni monto, adiós)
+                    # 1. Filtro basura
                     username = str(row.get('USERNAME', '')).strip()
                     amount_val = row.get('AMOUNT')
-                    
-                    # Chequeo estricto de vacío
                     is_amount_empty = pd.isna(amount_val) or amount_val is None
+                    
                     if (not username or username == 'None' or username == 'nan') and is_amount_empty:
                         continue
 
-                    # 2. Generar ID
+                    # 2. Generar Hash ID
                     unique_hash = generar_id_unico(row, sheet_name)
                     record_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_hash))
                     
                     if record_id in seen_ids: continue
                     seen_ids.add(record_id)
+
+                    # 3. Limpieza de valores clave
+                    amount_final = limpiar_valor(amount_val) or 0
+                    date_iso_final = row.get('date_posted_iso')
+
+                    # --- 4. NUEVO FILTRO: CONTENIDO DUPLICADO ---
+                    # Creamos una firma única con los datos que le importan a Supabase
+                    # Si ya vimos esta combinación exacta en este ciclo, saltamos.
+                    constraint_signature = f"{sheet_name}|{username}|{amount_final}|{date_iso_final}"
                     
-                    # Datos crudos
-                    raw_json_dict = row.to_dict()
+                    if constraint_signature in seen_constraints:
+                        # Detectamos un gemelo. Lo ignoramos silenciosamente para no romper la DB.
+                        continue
+                    
+                    seen_constraints.add(constraint_signature)
+                    # ---------------------------------------------
+
+                    posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
+                    raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
+                    status_value = str(row.get('Status', '')).strip()
 
                     record = {
                         "id": record_id,
                         "deposit_id": str(row.get('DEPOSIT ID', '')).strip(),
                         "brand": sheet_name,
                         "username": username,
-                        "amount": amount_val, # Se limpiará en el paso final
-                        "status": str(row.get('Status', '')).strip(),
+                        "amount": amount_final,
+                        "status": status_value, 
                         "deposit_date_user": str(row.get('DEPOSIT DATE', '')),
-                        "date_posted_unix": row.get('DATE POSTED'), # Se limpiará al final
-                        "date_posted_iso": row.get('date_posted_iso'), 
+                        "date_posted_unix": posted_final, 
+                        "date_posted_iso": date_iso_final, 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
-                        "raw_json": raw_json_dict, 
+                        "raw_json": raw_json_clean, 
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }
                     records_to_upload.append(record)
@@ -177,18 +197,16 @@ def run_sync_process():
 
             if records_to_upload:
                 try:
-                    # --- EL PASO MAGICO: SANITIZACIÓN TOTAL ---
-                    # Esto recorre todo el array y mata cualquier NaN escondido
                     safe_records = sanitize_for_json(records_to_upload)
 
-                    # 1. UPSERT
+                    # Upsert
                     supabase.table("deposits").upsert(
                         safe_records, on_conflict="id", ignore_duplicates=False
                     ).execute()
                     
                     total_nuevos += len(safe_records)
 
-                    # 2. BARRIDO
+                    # Barrido
                     supabase.table("deposits").update({"status": "CLEARED_AUTO"}) \
                         .eq("brand", sheet_name) \
                         .eq("status", "ALREADY FOLLOW UP") \
@@ -198,7 +216,9 @@ def run_sync_process():
                     print(f" ✅ {sheet_name}: OK ({len(safe_records)}).")
 
                 except Exception as e:
-                    print(f"❌ Error Supabase {sheet_name}: {e}")
+                    # Imprimir solo una parte del error para no saturar log
+                    err_msg = str(e)[:200] 
+                    print(f"❌ Error Supabase {sheet_name}: {err_msg}...")
 
         except Exception as e:
             print(f"❌ Error hoja {sheet_name}: {e}")
