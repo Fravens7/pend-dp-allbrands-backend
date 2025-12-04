@@ -5,7 +5,7 @@ import numpy as np
 import hashlib
 import uuid
 import asyncio
-import math # <--- IMPORTANTE
+import math
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -32,24 +32,37 @@ last_execution_info = {
     "records_processed": 0
 }
 
+# --- FUNCIÓN DE LIMPIEZA PROFUNDA ---
 def limpiar_valor(valor):
-    # 1. Atrapa NaNs de Pandas/Numpy
-    if pd.isna(valor): return None
+    """
+    Convierte NaNs, Infinitos y valores corruptos en None (Null) o tipos nativos seguros.
+    """
+    # 1. Chequeo de Pandas/Numpy nulls
+    if pd.isna(valor): 
+        return None
     
-    # 2. Atrapa NaNs nativos de Python (float('nan')) e Infinitos
-    if isinstance(valor, float):
+    # 2. Chequeo de strings vacíos
+    if isinstance(valor, str):
+        if not valor.strip(): return None
+        return valor
+    
+    # 3. Chequeo numérico estricto (JSON no soporta NaN)
+    if isinstance(valor, (float, np.floating)):
         if math.isnan(valor) or math.isinf(valor):
             return None
-            
-    if isinstance(valor, (np.integer, np.int64)): return int(valor)
-    if isinstance(valor, (np.floating, np.float64)): return float(valor)
+        return float(valor)
+        
+    if isinstance(valor, (int, np.integer)):
+        return int(valor)
+        
     return valor
 
 def generar_id_unico(row, brand):
-    raw_str = f"{brand}_{row.get('DEPOSIT ID')}_{row.get('USERNAME')}_{row.get('AMOUNT')}_{row.get('DATE POSTED')}"
+    # Usamos str() para asegurar que incluso si hay nones, se genere el hash
+    raw_str = f"{brand}_{str(row.get('DEPOSIT ID'))}_{str(row.get('USERNAME'))}_{str(row.get('AMOUNT'))}_{str(row.get('DATE POSTED'))}"
     return hashlib.md5(raw_str.encode()).hexdigest()
 
-# --- PROCESO DE SINCRONIZACIÓN CON BARRIDO ---
+# --- PROCESO DE SINCRONIZACIÓN ---
 def run_sync_process():
     global last_execution_info
     
@@ -57,7 +70,6 @@ def run_sync_process():
         print("⚠️ Ejecución anterior aún en curso. Saltando ciclo.")
         return
 
-    # Hora de inicio del ciclo (UTC)
     cycle_start_time = datetime.now(timezone.utc).isoformat()
     print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Iniciando Sync...")
     last_execution_info["status"] = "Running"
@@ -79,7 +91,7 @@ def run_sync_process():
             
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # BATCH GET (Traer todo de golpe)
+        # BATCH GET
         ranges = [f"{name}!A:Z" for name in SHEET_NAMES]
         try:
             batch_results = sh.values_batch_get(ranges)
@@ -95,7 +107,7 @@ def run_sync_process():
 
     total_nuevos = 0
     
-    # Procesar hoja por hoja
+    # Procesar hojas
     for i, result in enumerate(batch_results.get('valueRanges', [])):
         sheet_name = SHEET_NAMES[i]
         values = result.get('values', [])
@@ -110,11 +122,11 @@ def run_sync_process():
             df = pd.DataFrame(values, columns=final_headers)
             if df.empty: continue
             
-            # --- CORRECCIÓN CRÍTICA PARA "nan" ---
-            # Reemplazamos cualquier NaN o Infinito con None antes de procesar nada
-            df = df.replace([np.nan, np.inf, -np.inf], None)
+            # --- LIMPIEZA INICIAL DEL DATAFRAME ---
+            # Convertimos todo NaN a None desde el principio
+            df = df.replace({np.nan: None})
             
-            # Limpieza de fechas
+            # Fecha ISO
             if 'DATE POSTED' in df.columns:
                 timestamps_numeric = pd.to_numeric(df['DATE POSTED'], errors='coerce')
                 df['date_posted_iso'] = pd.to_datetime(timestamps_numeric, unit='s', errors='coerce')
@@ -127,19 +139,28 @@ def run_sync_process():
 
             for index, row in df.iterrows():
                 try:
+                    # 1. Verificar si la fila está vacía o es basura
+                    # Si no tiene Username ni Monto, la ignoramos.
+                    username = str(row.get('USERNAME', '')).strip()
+                    amount_check = row.get('AMOUNT', '')
+                    
+                    if not username and (amount_check is None or str(amount_check).strip() == ''):
+                        continue
+
+                    # 2. Generar ID
                     unique_hash = generar_id_unico(row, sheet_name)
                     record_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_hash))
                     
                     if record_id in seen_ids: continue
                     seen_ids.add(record_id)
                     
-                    # Al limpiar amount, nos aseguramos de que no queden NaNs
+                    # 3. Limpieza de Monto (Crucial para el error NaN)
                     raw_amount = pd.to_numeric(str(row.get('AMOUNT', '')).replace(',', ''), errors='coerce')
                     amount_final = limpiar_valor(raw_amount) or 0
                     
                     posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
                     
-                    # Limpieza profunda del JSON crudo
+                    # 4. Limpieza del JSON crudo
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
                     status_value = str(row.get('Status', '')).strip()
 
@@ -147,7 +168,7 @@ def run_sync_process():
                         "id": record_id,
                         "deposit_id": str(row.get('DEPOSIT ID', '')).strip() or f"NO_ID_{index}",
                         "brand": sheet_name,
-                        "username": str(row.get('USERNAME', '')),
+                        "username": username,
                         "amount": amount_final,
                         "status": status_value, 
                         "deposit_date_user": str(row.get('DEPOSIT DATE', '')),
@@ -171,33 +192,33 @@ def run_sync_process():
                     
                     total_nuevos += len(records_to_upload)
 
-                    # 2. BARRIDO (Limpieza de fantasmas)
+                    # 2. BARRIDO
                     supabase.table("deposits").update({"status": "CLEARED_AUTO"}) \
                         .eq("brand", sheet_name) \
                         .eq("status", "ALREADY FOLLOW UP") \
                         .lt("updated_at", cycle_start_time) \
                         .execute()
                         
-                    print(f" ✅ {sheet_name}: Sincronizado y Limpio.")
+                    print(f" ✅ {sheet_name}: OK ({len(records_to_upload)} registros).")
 
                 except Exception as e:
+                    # Esto atrapará el error si aún persiste, pero con más detalle
                     print(f"❌ Error Supabase {sheet_name}: {e}")
 
         except Exception as e:
-            print(f"❌ Error procesando data {sheet_name}: {e}")
+            print(f"❌ Error procesando {sheet_name}: {e}")
 
     last_execution_info["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     last_execution_info["status"] = "Idle"
     last_execution_info["records_processed"] = total_nuevos
     print(f"✅ Ciclo terminado. Total: {total_nuevos}")
 
-# --- AUTO-LOOP (HILO SECUNDARIO) ---
+# --- AUTO-LOOP ---
 async def start_periodic_sync():
-    print("⏳ Esperando arranque del servidor (5s)...")
+    print("⏳ Esperando arranque (5s)...")
     await asyncio.sleep(5)
-    
     while True:
-        print(f"💓 [{datetime.now().strftime('%H:%M:%S')}] Servidor activo. Esperando ciclo...")
+        print(f"💓 [{datetime.now().strftime('%H:%M:%S')}] Esperando ciclo...")
         await asyncio.to_thread(run_sync_process)
         await asyncio.sleep(20) 
 
@@ -205,20 +226,15 @@ async def start_periodic_sync():
 async def startup_event():
     asyncio.create_task(start_periodic_sync())
 
-# --- ENDPOINTS ---
 @app.get("/")
-def home():
-    return last_execution_info
+def home(): return last_execution_info
 
 @app.head("/")
-def health_check():
-    return "OK"
+def health_check(): return "OK"
 
 @app.get("/trigger-sync")
 def trigger_sync(background_tasks: BackgroundTasks, secret: str = None):
-    if secret != CRON_SECRET:
-        raise HTTPException(status_code=401, detail="Clave inválida")
-    if last_execution_info["status"] == "Running":
-         return {"message": "⚠️ En curso."}
+    if secret != CRON_SECRET: raise HTTPException(status_code=401, detail="Clave inválida")
+    if last_execution_info["status"] == "Running": return {"message": "⚠️ En curso."}
     background_tasks.add_task(run_sync_process)
-    return {"message": "Sync manual iniciada"}
+    return {"message": "Sync iniciada"}
