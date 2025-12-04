@@ -12,7 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from datetime import datetime, timezone
 
-# --- CONFIGURACIÓN ---
 app = FastAPI(title="Deposit Dashboard Worker Ultra-Fast")
 
 app.add_middleware(
@@ -32,7 +31,6 @@ last_execution_info = {
     "records_processed": 0
 }
 
-# --- SANITIZADOR ---
 def sanitize_for_json(obj):
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj): return None
@@ -61,11 +59,17 @@ def limpiar_valor(valor):
     if isinstance(valor, (int, np.integer)): return int(valor)
     return valor
 
-def generar_id_unico(row, brand):
-    raw_str = f"{brand}_{str(row.get('DEPOSIT ID'))}_{str(row.get('USERNAME'))}_{str(row.get('AMOUNT'))}_{str(row.get('DATE POSTED'))}"
+# --- NUEVA LÓGICA DE IDENTIDAD ---
+def generar_id_normalizado(brand, username, amount, date_iso):
+    """
+    Genera un ID basado ÚNICAMENTE en los datos que definen la unicidad en la BD.
+    Ignora 'DEPOSIT ID' porque suele tener errores humanos.
+    """
+    # Usamos separadores '|' para evitar colisiones
+    # Ejemplo: "M1|juanperez|100.0|2025-10-04 10:00:00"
+    raw_str = f"{brand}|{str(username).strip()}|{str(amount)}|{str(date_iso)}"
     return hashlib.md5(raw_str.encode()).hexdigest()
 
-# --- PROCESO ---
 def run_sync_process():
     global last_execution_info
     
@@ -74,7 +78,7 @@ def run_sync_process():
         return
 
     cycle_start_time = datetime.now(timezone.utc).isoformat()
-    print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Iniciando Sync...")
+    print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Iniciando Sync Normalizada...")
     last_execution_info["status"] = "Running"
 
     try:
@@ -86,12 +90,6 @@ def run_sync_process():
              return
 
         sh = gc.open_by_key(SPREADSHEET_ID)
-        
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            print("❌ Faltan variables SUPABASE")
-            last_execution_info["status"] = "Error: Env Vars"
-            return
-            
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
         ranges = [f"{name}!A:Z" for name in SHEET_NAMES]
@@ -122,10 +120,12 @@ def run_sync_process():
             df = pd.DataFrame(values, columns=final_headers)
             if df.empty: continue
             
-            # Limpiezas previas
+            # --- PRE-PROCESAMIENTO DE CAMPOS CLAVE ---
+            # 1. Limpieza de Monto
             if 'AMOUNT' in df.columns:
                 df['AMOUNT'] = pd.to_numeric(df['AMOUNT'].astype(str).str.replace(',', ''), errors='coerce')
             
+            # 2. Limpieza de Fecha (ISO)
             if 'DATE POSTED' in df.columns:
                 timestamps_numeric = pd.to_numeric(df['DATE POSTED'], errors='coerce')
                 df['date_posted_iso'] = pd.to_datetime(timestamps_numeric, unit='s', errors='coerce')
@@ -133,67 +133,55 @@ def run_sync_process():
             else:
                 df['date_posted_iso'] = None
 
-            records_to_upload = []
-            
-            # --- FILTROS DE DEDUPLICACIÓN ---
-            seen_ids = set()          # Para IDs generados (Hash)
-            seen_constraints = set()  # NUEVO: Para contenido real (Marca+User+Monto+Fecha)
+            # --- DEDUPLICACIÓN AUTOMÁTICA ---
+            # Usamos un diccionario (Map) donde la clave es el ID Único.
+            # Si hay duplicados en el Excel, el último sobreescribe al anterior automáticamente.
+            unique_records_map = {}
 
             for index, row in df.iterrows():
                 try:
                     # 1. Filtro basura
                     username = str(row.get('USERNAME', '')).strip()
-                    amount_val = row.get('AMOUNT')
-                    is_amount_empty = pd.isna(amount_val) or amount_val is None
+                    amount_val = limpiar_valor(row.get('AMOUNT')) or 0
                     
-                    if (not username or username == 'None' or username == 'nan') and is_amount_empty:
+                    if (not username or username == 'None' or username == 'nan') and amount_val == 0:
                         continue
 
-                    # 2. Generar Hash ID
-                    unique_hash = generar_id_unico(row, sheet_name)
+                    date_iso = row.get('date_posted_iso')
+
+                    # 2. GENERACIÓN DE ID NORMALIZADO
+                    # Aquí está la magia: El ID depende de los datos, no de la fila.
+                    unique_hash = generar_id_normalizado(sheet_name, username, amount_val, date_iso)
                     record_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_hash))
                     
-                    if record_id in seen_ids: continue
-                    seen_ids.add(record_id)
-
-                    # 3. Limpieza de valores clave
-                    amount_final = limpiar_valor(amount_val) or 0
-                    date_iso_final = row.get('date_posted_iso')
-
-                    # --- 4. NUEVO FILTRO: CONTENIDO DUPLICADO ---
-                    # Creamos una firma única con los datos que le importan a Supabase
-                    # Si ya vimos esta combinación exacta en este ciclo, saltamos.
-                    constraint_signature = f"{sheet_name}|{username}|{amount_final}|{date_iso_final}"
-                    
-                    if constraint_signature in seen_constraints:
-                        # Detectamos un gemelo. Lo ignoramos silenciosamente para no romper la DB.
-                        continue
-                    
-                    seen_constraints.add(constraint_signature)
-                    # ---------------------------------------------
-
-                    posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
+                    # 3. Construcción del Registro
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
                     status_value = str(row.get('Status', '')).strip()
+                    deposit_id_display = str(row.get('DEPOSIT ID', '')).strip()
 
                     record = {
                         "id": record_id,
-                        "deposit_id": str(row.get('DEPOSIT ID', '')).strip(),
+                        "deposit_id": deposit_id_display, # Guardamos el ID visual, pero no lo usamos para unicidad
                         "brand": sheet_name,
                         "username": username,
-                        "amount": amount_final,
+                        "amount": amount_val,
                         "status": status_value, 
                         "deposit_date_user": str(row.get('DEPOSIT DATE', '')),
-                        "date_posted_unix": posted_final, 
-                        "date_posted_iso": date_iso_final, 
+                        "date_posted_unix": limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')), 
+                        "date_posted_iso": date_iso, 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
                         "raw_json": raw_json_clean, 
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }
-                    records_to_upload.append(record)
+                    
+                    # 4. Guardar en el mapa (Auto-fusión de duplicados)
+                    unique_records_map[record_id] = record
                     
                 except Exception:
                     continue
+
+            # Convertimos el mapa a lista para subir
+            records_to_upload = list(unique_records_map.values())
 
             if records_to_upload:
                 try:
@@ -213,12 +201,10 @@ def run_sync_process():
                         .lt("updated_at", cycle_start_time) \
                         .execute()
                         
-                    print(f" ✅ {sheet_name}: OK ({len(safe_records)}).")
+                    print(f" ✅ {sheet_name}: OK ({len(safe_records)} únicos).")
 
                 except Exception as e:
-                    # Imprimir solo una parte del error para no saturar log
-                    err_msg = str(e)[:200] 
-                    print(f"❌ Error Supabase {sheet_name}: {err_msg}...")
+                    print(f"❌ Error Supabase {sheet_name}: {str(e)[:150]}...")
 
         except Exception as e:
             print(f"❌ Error hoja {sheet_name}: {e}")
