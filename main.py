@@ -6,6 +6,7 @@ import hashlib
 import uuid
 import asyncio
 import math
+import json
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -18,7 +19,6 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# TUS VARIABLES
 SPREADSHEET_ID = "1i63fQR8_M8eWLdZsa3QPL_aOCg8labb_W9QmK_w8FXY"
 SHEET_NAMES = ['M1', 'M2', 'B1', 'B2', 'K1', 'B3', 'B4']
 CREDENTIALS_FILE = "credentials.json"
@@ -32,33 +32,32 @@ last_execution_info = {
     "records_processed": 0
 }
 
-# --- FUNCIÓN DE LIMPIEZA PROFUNDA ---
-def limpiar_valor(valor):
+# --- SANITIZADOR RECURSIVO (LA SOLUCIÓN FINAL) ---
+def sanitize_for_json(obj):
     """
-    Convierte NaNs, Infinitos y valores corruptos en None (Null) o tipos nativos seguros.
+    Recorre recursivamente cualquier objeto (dict, list) y reemplaza
+    NaNs o Infinitos con None. Esto asegura compatibilidad JSON 100%.
     """
-    # 1. Chequeo de Pandas/Numpy nulls
-    if pd.isna(valor): 
-        return None
-    
-    # 2. Chequeo de strings vacíos
-    if isinstance(valor, str):
-        if not valor.strip(): return None
-        return valor
-    
-    # 3. Chequeo numérico estricto (JSON no soporta NaN)
-    if isinstance(valor, (float, np.floating)):
-        if math.isnan(valor) or math.isinf(valor):
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
             return None
-        return float(valor)
-        
-    if isinstance(valor, (int, np.integer)):
-        return int(valor)
-        
-    return valor
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif pd.isna(obj):
+        return None
+    return obj
 
 def generar_id_unico(row, brand):
-    # Usamos str() para asegurar que incluso si hay nones, se genere el hash
+    # Convertimos a string forzado para evitar errores de hash
     raw_str = f"{brand}_{str(row.get('DEPOSIT ID'))}_{str(row.get('USERNAME'))}_{str(row.get('AMOUNT'))}_{str(row.get('DATE POSTED'))}"
     return hashlib.md5(raw_str.encode()).hexdigest()
 
@@ -67,7 +66,7 @@ def run_sync_process():
     global last_execution_info
     
     if last_execution_info["status"] == "Running":
-        print("⚠️ Ejecución anterior aún en curso. Saltando ciclo.")
+        print("⚠️ En curso.")
         return
 
     cycle_start_time = datetime.now(timezone.utc).isoformat()
@@ -78,7 +77,7 @@ def run_sync_process():
         if os.path.exists(CREDENTIALS_FILE):
              gc = gspread.service_account(filename=CREDENTIALS_FILE)
         else:
-             print("⚠️ No se encontró credentials.json")
+             print("⚠️ No credentials.json")
              last_execution_info["status"] = "Error: No credentials"
              return
 
@@ -91,23 +90,22 @@ def run_sync_process():
             
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # BATCH GET
+        # Batch Get
         ranges = [f"{name}!A:Z" for name in SHEET_NAMES]
         try:
             batch_results = sh.values_batch_get(ranges)
         except Exception as e:
-            print(f"❌ Error leyendo Google Sheets: {e}")
+            print(f"❌ Error Google API: {e}")
             last_execution_info["status"] = "Error Google API"
             return
 
     except Exception as e:
-        print(f"❌ Error conexión inicial: {e}")
+        print(f"❌ Error conexión: {e}")
         last_execution_info["status"] = f"Error connection: {str(e)}"
         return
 
     total_nuevos = 0
     
-    # Procesar hojas
     for i, result in enumerate(batch_results.get('valueRanges', [])):
         sheet_name = SHEET_NAMES[i]
         values = result.get('values', [])
@@ -122,11 +120,11 @@ def run_sync_process():
             df = pd.DataFrame(values, columns=final_headers)
             if df.empty: continue
             
-            # --- LIMPIEZA INICIAL DEL DATAFRAME ---
-            # Convertimos todo NaN a None desde el principio
-            df = df.replace({np.nan: None})
+            # --- LIMPIEZA PRELIMINAR ---
+            # Forzamos conversión a numérico donde corresponde para detectar NaNs
+            if 'AMOUNT' in df.columns:
+                df['AMOUNT'] = pd.to_numeric(df['AMOUNT'].astype(str).str.replace(',', ''), errors='coerce')
             
-            # Fecha ISO
             if 'DATE POSTED' in df.columns:
                 timestamps_numeric = pd.to_numeric(df['DATE POSTED'], errors='coerce')
                 df['date_posted_iso'] = pd.to_datetime(timestamps_numeric, unit='s', errors='coerce')
@@ -139,12 +137,13 @@ def run_sync_process():
 
             for index, row in df.iterrows():
                 try:
-                    # 1. Verificar si la fila está vacía o es basura
-                    # Si no tiene Username ni Monto, la ignoramos.
+                    # 1. Filtro de Fila Vacía (Si no hay usuario ni monto, adiós)
                     username = str(row.get('USERNAME', '')).strip()
-                    amount_check = row.get('AMOUNT', '')
+                    amount_val = row.get('AMOUNT')
                     
-                    if not username and (amount_check is None or str(amount_check).strip() == ''):
+                    # Chequeo estricto de vacío
+                    is_amount_empty = pd.isna(amount_val) or amount_val is None
+                    if (not username or username == 'None' or username == 'nan') and is_amount_empty:
                         continue
 
                     # 2. Generar ID
@@ -154,28 +153,21 @@ def run_sync_process():
                     if record_id in seen_ids: continue
                     seen_ids.add(record_id)
                     
-                    # 3. Limpieza de Monto (Crucial para el error NaN)
-                    raw_amount = pd.to_numeric(str(row.get('AMOUNT', '')).replace(',', ''), errors='coerce')
-                    amount_final = limpiar_valor(raw_amount) or 0
-                    
-                    posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
-                    
-                    # 4. Limpieza del JSON crudo
-                    raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
-                    status_value = str(row.get('Status', '')).strip()
+                    # Datos crudos
+                    raw_json_dict = row.to_dict()
 
                     record = {
                         "id": record_id,
-                        "deposit_id": str(row.get('DEPOSIT ID', '')).strip() or f"NO_ID_{index}",
+                        "deposit_id": str(row.get('DEPOSIT ID', '')).strip(),
                         "brand": sheet_name,
                         "username": username,
-                        "amount": amount_final,
-                        "status": status_value, 
+                        "amount": amount_val, # Se limpiará en el paso final
+                        "status": str(row.get('Status', '')).strip(),
                         "deposit_date_user": str(row.get('DEPOSIT DATE', '')),
-                        "date_posted_unix": posted_final, 
+                        "date_posted_unix": row.get('DATE POSTED'), # Se limpiará al final
                         "date_posted_iso": row.get('date_posted_iso'), 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
-                        "raw_json": raw_json_clean, 
+                        "raw_json": raw_json_dict, 
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }
                     records_to_upload.append(record)
@@ -185,12 +177,16 @@ def run_sync_process():
 
             if records_to_upload:
                 try:
+                    # --- EL PASO MAGICO: SANITIZACIÓN TOTAL ---
+                    # Esto recorre todo el array y mata cualquier NaN escondido
+                    safe_records = sanitize_for_json(records_to_upload)
+
                     # 1. UPSERT
                     supabase.table("deposits").upsert(
-                        records_to_upload, on_conflict="id", ignore_duplicates=False
+                        safe_records, on_conflict="id", ignore_duplicates=False
                     ).execute()
                     
-                    total_nuevos += len(records_to_upload)
+                    total_nuevos += len(safe_records)
 
                     # 2. BARRIDO
                     supabase.table("deposits").update({"status": "CLEARED_AUTO"}) \
@@ -199,21 +195,19 @@ def run_sync_process():
                         .lt("updated_at", cycle_start_time) \
                         .execute()
                         
-                    print(f" ✅ {sheet_name}: OK ({len(records_to_upload)} registros).")
+                    print(f" ✅ {sheet_name}: OK ({len(safe_records)}).")
 
                 except Exception as e:
-                    # Esto atrapará el error si aún persiste, pero con más detalle
                     print(f"❌ Error Supabase {sheet_name}: {e}")
 
         except Exception as e:
-            print(f"❌ Error procesando {sheet_name}: {e}")
+            print(f"❌ Error hoja {sheet_name}: {e}")
 
     last_execution_info["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     last_execution_info["status"] = "Idle"
     last_execution_info["records_processed"] = total_nuevos
     print(f"✅ Ciclo terminado. Total: {total_nuevos}")
 
-# --- AUTO-LOOP ---
 async def start_periodic_sync():
     print("⏳ Esperando arranque (5s)...")
     await asyncio.sleep(5)
