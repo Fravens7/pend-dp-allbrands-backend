@@ -5,6 +5,7 @@ import numpy as np
 import hashlib
 import uuid
 import asyncio
+import math # <--- IMPORTANTE
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -32,7 +33,14 @@ last_execution_info = {
 }
 
 def limpiar_valor(valor):
+    # 1. Atrapa NaNs de Pandas/Numpy
     if pd.isna(valor): return None
+    
+    # 2. Atrapa NaNs nativos de Python (float('nan')) e Infinitos
+    if isinstance(valor, float):
+        if math.isnan(valor) or math.isinf(valor):
+            return None
+            
     if isinstance(valor, (np.integer, np.int64)): return int(valor)
     if isinstance(valor, (np.floating, np.float64)): return float(valor)
     return valor
@@ -92,7 +100,6 @@ def run_sync_process():
         sheet_name = SHEET_NAMES[i]
         values = result.get('values', [])
         
-        # Saltamos si no hay datos suficientes
         if len(values) < 2:
             continue
 
@@ -102,6 +109,10 @@ def run_sync_process():
             
             df = pd.DataFrame(values, columns=final_headers)
             if df.empty: continue
+            
+            # --- CORRECCIÓN CRÍTICA PARA "nan" ---
+            # Reemplazamos cualquier NaN o Infinito con None antes de procesar nada
+            df = df.replace([np.nan, np.inf, -np.inf], None)
             
             # Limpieza de fechas
             if 'DATE POSTED' in df.columns:
@@ -122,9 +133,13 @@ def run_sync_process():
                     if record_id in seen_ids: continue
                     seen_ids.add(record_id)
                     
+                    # Al limpiar amount, nos aseguramos de que no queden NaNs
                     raw_amount = pd.to_numeric(str(row.get('AMOUNT', '')).replace(',', ''), errors='coerce')
                     amount_final = limpiar_valor(raw_amount) or 0
+                    
                     posted_final = limpiar_valor(pd.to_numeric(row.get('DATE POSTED'), errors='coerce')) if 'DATE POSTED' in row else None
+                    
+                    # Limpieza profunda del JSON crudo
                     raw_json_clean = {k: limpiar_valor(v) for k, v in row.to_dict().items()}
                     status_value = str(row.get('Status', '')).strip()
 
@@ -140,7 +155,6 @@ def run_sync_process():
                         "date_posted_iso": row.get('date_posted_iso'), 
                         "pg_assign": str(row.get('PG ASSIGN', '')),
                         "raw_json": raw_json_clean, 
-                        # IMPORTANTE: Esta fecha permite el "Barrido"
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }
                     records_to_upload.append(record)
@@ -150,18 +164,14 @@ def run_sync_process():
 
             if records_to_upload:
                 try:
-                    # 1. UPSERT (Actualizamos lo que existe en el Excel)
+                    # 1. UPSERT
                     supabase.table("deposits").upsert(
                         records_to_upload, on_conflict="id", ignore_duplicates=False
                     ).execute()
                     
                     total_nuevos += len(records_to_upload)
 
-                    # 2. EL BARRIDO (THE SWEEP) - Limpieza de fantasmas
-                    # Lógica: "Si eres de esta Marca, tienes estatus 'ALREADY FOLLOW UP',
-                    # PERO tu fecha 'updated_at' es vieja (menor a cycle_start_time),
-                    # significa que NO estabas en el Excel que acabo de leer. ¡Desaparece!"
-                    
+                    # 2. BARRIDO (Limpieza de fantasmas)
                     supabase.table("deposits").update({"status": "CLEARED_AUTO"}) \
                         .eq("brand", sheet_name) \
                         .eq("status", "ALREADY FOLLOW UP") \
@@ -187,13 +197,8 @@ async def start_periodic_sync():
     await asyncio.sleep(5)
     
     while True:
-        # HEARTBEAT: Mensaje para saber que no estamos muertos
         print(f"💓 [{datetime.now().strftime('%H:%M:%S')}] Servidor activo. Esperando ciclo...")
-        
-        # Ejecutar proceso en hilo aparte
         await asyncio.to_thread(run_sync_process)
-        
-        # Esperar 20 segundos
         await asyncio.sleep(20) 
 
 @app.on_event("startup")
